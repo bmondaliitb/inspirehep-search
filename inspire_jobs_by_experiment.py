@@ -8,6 +8,7 @@ It has no third-party dependencies and defaults to active hep-ex positions.
 from __future__ import annotations
 
 import argparse
+import calendar
 import html
 import json
 import sys
@@ -83,14 +84,33 @@ def _request_json(url: str, timeout: float, retries: int = 3) -> dict[str, Any]:
     raise AssertionError("unreachable")
 
 
-def fetch_jobs(category: str, limit: int, timeout: float) -> list[dict[str, Any]]:
-    """Fetch active jobs in *category*, following API pagination links."""
-    page_size = min(100, limit) if limit else 100
-    query = f"status:open AND arxiv_categories:{category}"
+def subtract_months(day: date, months: int) -> date:
+    """Subtract calendar months, clamping the day at the end of the month."""
+    month_index = day.year * 12 + day.month - 1 - months
+    year, month_index = divmod(month_index, 12)
+    month = month_index + 1
+    return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _parse_deadline(value: str | None) -> date | None:
+    try:
+        return date.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+def fetch_jobs(category: str, window: str, timeout: float) -> list[dict[str, Any]]:
+    """Fetch jobs in *category* for the requested deadline window."""
+    if window == "current":
+        query = f"status:open AND arxiv_categories:{category}"
+    else:
+        cutoff = subtract_months(date.today(), int(window.removesuffix("m"))).isoformat()
+        query = f"(status:open OR deadline_date:[{cutoff} TO *]) AND arxiv_categories:{category}"
+    page_size = 100
     url: str | None = f"{API_URL}?{urlencode({'q': query, 'sort': 'deadline', 'size': page_size})}"
     jobs: list[dict[str, Any]] = []
 
-    while url and (not limit or len(jobs) < limit):
+    while url:
         payload = _request_json(url, timeout)
         hits = payload.get("hits", {}).get("hits", [])
         if not isinstance(hits, list):
@@ -99,7 +119,7 @@ def fetch_jobs(category: str, limit: int, timeout: float) -> list[dict[str, Any]
         next_url = payload.get("links", {}).get("next")
         url = next_url if isinstance(next_url, str) else None
 
-    return jobs[:limit] if limit else jobs
+    return jobs
 
 
 def _values(items: Any, key: str) -> list[str]:
@@ -118,6 +138,7 @@ def normalize_job(hit: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "id": job_id,
+        "status": str(metadata.get("status") or "").lower(),
         "title": metadata.get("position") or "Untitled position",
         "institutions": _values(metadata.get("institutions"), "value"),
         "ranks": [str(rank) for rank in metadata.get("ranks", []) if rank],
@@ -211,11 +232,13 @@ def render_text(jobs: list[dict[str, Any]], category: str, details: bool, width:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_json(jobs: list[dict[str, Any]], category: str) -> str:
+def render_json(jobs: list[dict[str, Any]], category: str, window: str, ranks: list[str]) -> str:
     groups = group_jobs(jobs)
     output = {
         "fetched_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "category": category,
+        "window": window,
+        "ranks": ranks,
         "unique_advertisement_count": len(jobs),
         "groups": [
             {"experiment": experiment, "count": len(ads), "advertisements": ads}
@@ -241,6 +264,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="maximum number of advertisements to fetch; 0 means all (default: 0)",
     )
     parser.add_argument(
+        "--window",
+        choices=("current", "3m", "6m"),
+        default="current",
+        help="current openings, or current plus ads with deadlines in the last 3/6 months (default: current)",
+    )
+    parser.add_argument(
+        "--rank",
+        nargs="+",
+        choices=("postdoc", "senior"),
+        metavar="{postdoc,senior}",
+        help="only show one or both position ranks (default: all ranks)",
+    )
+    parser.add_argument(
         "--details",
         action="store_true",
         help="include the full plain-text job description in text output",
@@ -262,10 +298,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        raw_jobs = fetch_jobs(args.category, args.limit, args.timeout)
+        raw_jobs = fetch_jobs(args.category, args.window, args.timeout)
         jobs = [normalize_job(job) for job in raw_jobs]
+        if args.window == "current":
+            jobs = [job for job in jobs if job["status"] == "open"]
+        else:
+            cutoff = subtract_months(date.today(), int(args.window.removesuffix("m")))
+            jobs = [
+                job
+                for job in jobs
+                if job["status"] == "open" or (_parse_deadline(job["deadline"]) or date.min) >= cutoff
+            ]
+        if args.rank:
+            requested_ranks = {rank.upper() for rank in args.rank}
+            jobs = [job for job in jobs if requested_ranks.intersection(job["ranks"])]
+        if args.limit:
+            jobs = jobs[: args.limit]
         output = (
-            render_json(jobs, args.category)
+            render_json(jobs, args.category, args.window, args.rank or [])
             if args.json
             else render_text(jobs, args.category, args.details, args.width)
         )

@@ -21,6 +21,12 @@ python3 inspire_jobs_by_experiment.py --json --output hep-ex-jobs.json
 
 # Quick preview of the first 10 advertisements
 python3 inspire_jobs_by_experiment.py --limit 10
+
+# Current openings plus advertisements with deadlines in the last 3 months
+python3 inspire_jobs_by_experiment.py --window 3m
+
+# Current openings plus the last 6 months, limited to postdocs and senior jobs
+python3 inspire_jobs_by_experiment.py --window 6m --rank postdoc senior
 ```
 
 The default terminal output includes the title, institution, rank, region,
